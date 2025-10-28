@@ -1,6 +1,7 @@
 # ==========================================
 # app.py - Expense Manager (Streamlit + SQLite)
 # Bản đầy đủ: giao diện tiếng Việt + trang Hướng dẫn
+# (đã thêm: nhập tiền có dấu chấm, lưu cả giờ giao dịch)
 # ==========================================
 
 import streamlit as st
@@ -12,9 +13,33 @@ import altair as alt
 from pathlib import Path
 from collections import defaultdict
 import random
+import re
 
 DB_PATH = "expense.db"
 ENABLE_DEMO = True  # tạo tài khoản demo cho nhóm dev
+
+# =========================
+# Helpers: tiền tệ & thời gian
+# =========================
+def format_vnd(n: float | int) -> str:
+    try:
+        return f"{float(n):,.0f}".replace(",", ".")
+    except Exception:
+        return str(n)
+
+def parse_vnd_str(s: str) -> float:
+    """
+    Nhận chuỗi nhập tiền kiểu VN (VD: '20.000.000', '1,000,000', '  50000  ')
+    -> trả về số (float)
+    """
+    if s is None:
+        return 0.0
+    digits = re.sub(r"[^\d]", "", str(s))
+    return float(digits) if digits else 0.0
+
+def join_date_time(d: dt.date, t: dt.time) -> str:
+    """Ghép ngày + giờ thành chuỗi 'YYYY-MM-DD HH:MM'"""
+    return dt.datetime.combine(d, t.replace(second=0, microsecond=0)).strftime("%Y-%m-%d %H:%M")
 
 # =========================
 # Database & Helper
@@ -179,12 +204,12 @@ def seed_demo_user_once(conn):
     for n, t in cats:
         conn.execute("INSERT INTO categories(user_id,name,type) VALUES(?,?,?)", (uid, n, t))
 
-    # tạo 1 số giao dịch mẫu
+    # tạo 1 số giao dịch mẫu (ngày ngẫu nhiên, không cần giờ)
     accs = conn.execute("SELECT id FROM accounts WHERE user_id=?", (uid,)).fetchall()
     cat_exp = conn.execute("SELECT id FROM categories WHERE user_id=? AND type='expense'", (uid,)).fetchall()
     cat_inc = conn.execute("SELECT id FROM categories WHERE user_id=? AND type='income'", (uid,)).fetchall()
 
-    for i in range(25):
+    for _ in range(25):
         ttype = random.choice(["expense", "income"])
         amt = random.randint(100000, 2000000)
         acc_id = random.choice(accs)["id"]
@@ -195,10 +220,10 @@ def seed_demo_user_once(conn):
             VALUES(?,?,?,?,?,?,?,?)""",
             (uid, acc_id, ttype, cat_id, amt, "VND", str(date), now))
     conn.commit()
+
 # =========================
 # Transaction & Category utilities
 # =========================
-
 TYPE_LABELS_VN = {"expense": "Chi tiêu", "income": "Thu nhập"}
 ACCOUNT_TYPE_LABEL_VN = {"cash": "Tiền mặt", "bank": "Tài khoản ngân hàng", "card": "Thẻ"}
 
@@ -226,7 +251,7 @@ def df_tx_vi(df: pd.DataFrame) -> pd.DataFrame:
         return df
     m_cols = {
         "id": "ID",
-        "occurred_at": "Ngày",
+        "occurred_at": "Thời điểm",
         "type": "Loại",
         "amount": "Số tiền",
         "currency": "Tiền tệ",
@@ -239,8 +264,9 @@ def df_tx_vi(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={k: v for k, v in m_cols.items() if k in df.columns}).copy()
     if "Loại" in df.columns:
         df["Loại"] = df["Loại"].map({"expense": "Chi tiêu", "income": "Thu nhập"}).fillna(df["Loại"])
+    if "Số tiền" in df.columns:
+        df["Số tiền"] = df["Số tiền"].map(lambda x: format_vnd(x))
     return df
-
 
 def get_accounts(uid):
     return get_df("SELECT * FROM accounts WHERE user_id=?", (uid,))
@@ -254,12 +280,12 @@ def get_categories(uid, ttype=None):
     q += " ORDER BY name"
     return get_df(q, tuple(p))
 
-def add_transaction(uid, account_id, ttype, category_id, amount, notes, date):
+def add_transaction(uid, account_id, ttype, category_id, amount, notes, occurred_dt: str):
     now = dt.datetime.now().isoformat()
     execute("""
         INSERT INTO transactions(user_id,account_id,type,category_id,amount,currency,occurred_at,created_at)
         VALUES(?,?,?,?,?,?,?,?)""",
-        (uid, account_id, ttype, category_id, amount, "VND", str(date), now)
+        (uid, account_id, ttype, category_id, amount, "VND", occurred_dt, now)
     )
 
 def add_category(uid, name, ttype):
@@ -268,10 +294,10 @@ def add_category(uid, name, ttype):
 def add_account(uid, name, ttype, balance):
     execute("INSERT INTO accounts(user_id,name,type,opening_balance,created_at) VALUES(?,?,?,?,?)",
             (uid, name.strip(), ttype, balance, dt.datetime.now().isoformat()))
+
 # =========================
 # Trang Hướng dẫn & Giao dịch
 # =========================
-
 def page_help(uid):
     st.subheader("📘 Hướng dẫn sử dụng")
     st.markdown("""
@@ -293,7 +319,7 @@ def page_help(uid):
 
 ### 🧾 Giao dịch
 - Form “Thêm nhanh” nhập nhanh các khoản thu/chi  
-- Bật “Hiện tùy chọn nâng cao” để thêm **Ghi chú, Thẻ**
+- Nhập tiền dạng `20.000.000`, chọn **Ngày** và **Giờ** giao dịch.
 
 ### 👛 Ví / Tài khoản
 - Quản lý các ví: **Tiền mặt, Ngân hàng, Thẻ**  
@@ -309,7 +335,6 @@ def page_help(uid):
 - **Top danh mục chi** + xuất **CSV** ở trang Cài đặt
     """)
 
-
 def page_transactions(uid):
     st.subheader("🧾 Giao dịch")
     accounts = get_accounts(uid)
@@ -319,21 +344,38 @@ def page_transactions(uid):
     with st.expander("➕ Thêm giao dịch mới", expanded=True):
         ttype = st.radio("Loại giao dịch", ["Chi tiêu", "Thu nhập"], horizontal=True)
         acc = st.selectbox("Chọn ví/tài khoản", accounts["name"])
-        cat = st.selectbox("Chọn danh mục",
-            cats_exp["name"] if ttype == "Chi tiêu" else cats_inc["name"])
-        amt = st.number_input("Số tiền (VND)", min_value=0, step=1000)
+        cat = st.selectbox(
+            "Chọn danh mục",
+            cats_exp["name"] if ttype == "Chi tiêu" else cats_inc["name"]
+        )
+
+        # Nhập số tiền dạng text để hiện dấu chấm
+        amt_text = st.text_input("Số tiền (VND)", placeholder="VD: 20.000.000")
         notes = st.text_input("Ghi chú (tùy chọn)")
+
+        # Ngày + Giờ
         date = st.date_input("Ngày giao dịch", value=dt.date.today())
+        time = st.time_input(
+            "Giờ giao dịch",
+            value=dt.datetime.now().time().replace(second=0, microsecond=0)
+        )
 
         if st.button("Lưu giao dịch", use_container_width=True):
-            acc_id = int(accounts[accounts["name"] == acc]["id"].iloc[0])
-            cat_id = int((cats_exp if ttype == "Chi tiêu" else cats_inc)[
-                (cats_exp if ttype == "Chi tiêu" else cats_inc)["name"] == cat
-            ]["id"].iloc[0])
-            add_transaction(uid, acc_id,
-                            "expense" if ttype == "Chi tiêu" else "income",
-                            cat_id, amt, notes, date)
-            st.success("✅ Giao dịch đã được lưu!")
+            try:
+                amt = parse_vnd_str(amt_text)
+                if amt <= 0:
+                    st.error("Số tiền phải lớn hơn 0.")
+                    st.stop()
+                acc_id = int(accounts[accounts["name"] == acc]["id"].iloc[0])
+                cats_df = (cats_exp if ttype == "Chi tiêu" else cats_inc)
+                cat_id = int(cats_df[cats_df["name"] == cat]["id"].iloc[0])
+                occurred_dt = join_date_time(date, time)
+                add_transaction(uid, acc_id,
+                                "expense" if ttype == "Chi tiêu" else "income",
+                                cat_id, amt, notes, occurred_dt)
+                st.success("✅ Giao dịch đã được lưu!")
+            except Exception:
+                st.error("Vui lòng nhập số tiền hợp lệ (ví dụ: 20.000.000).")
 
     st.divider()
     st.write("### 📊 Danh sách giao dịch gần đây")
@@ -343,6 +385,7 @@ def page_transactions(uid):
         st.info("Chưa có giao dịch nào.")
     else:
         st.dataframe(df, use_container_width=True, hide_index=True)
+
 # =========================
 # KPI & Charts cho Trang chủ
 # =========================
@@ -358,9 +401,9 @@ def kpi_month(uid, start_date, end_date):
     expense = float(row["expense"] or 0)
     net = income - expense
     c1, c2, c3 = st.columns(3)
-    c1.metric("Tổng thu", f"{income:,.0f} VND")
-    c2.metric("Tổng chi", f"{expense:,.0f} VND")
-    c3.metric("Net (thu - chi)", f"{net:,.0f} VND")
+    c1.metric("Tổng thu", f"{format_vnd(income)} VND")
+    c2.metric("Tổng chi", f"{format_vnd(expense)} VND")
+    c3.metric("Net (thu - chi)", f"{format_vnd(net)} VND")
 
 def chart_spending_by_day(uid, start_date, end_date):
     df = get_df("""
@@ -479,10 +522,11 @@ def page_accounts(uid):
         balances = []
         for _, r in df_disp.iterrows():
             balances.append(current_balance(uid, int(r["id"])))
-        df_disp["Số dư hiện tại"] = balances
+        df_disp["Số dư hiện tại"] = [format_vnd(x) for x in balances]
         df_disp = df_disp.rename(columns={
             "id": "ID", "currency": "Tiền tệ", "opening_balance": "Số dư ban đầu"
         })
+        df_disp["Số dư ban đầu"] = df_disp["Số dư ban đầu"].map(lambda x: format_vnd(x))
         df_disp = df_disp[["ID","Hiển thị","Loại","Tiền tệ","Số dư ban đầu","Số dư hiện tại"]]
         st.dataframe(df_disp, use_container_width=True, height=320)
 
@@ -518,6 +562,7 @@ def page_categories(uid):
             st.rerun()
         else:
             st.error("Tên danh mục không được để trống.")
+
 # =========================
 # Ngân sách
 # =========================
@@ -555,6 +600,7 @@ def page_budgets(uid):
             "id":"ID","category":"Danh mục","amount":"Hạn mức (VND)",
             "start_date":"Từ ngày","end_date":"Đến ngày"
         })
+        df["Hạn mức (VND)"] = df["Hạn mức (VND)"].map(lambda x: format_vnd(x))
         st.dataframe(df, use_container_width=True, height=260)
 
 # =========================
@@ -618,7 +664,7 @@ def onboarding_wizard(uid):
             set_user_profile(uid, name.strip()); st.session_state.ob_step = 2; st.rerun()
 
     elif st.session_state.ob_step == 2:
-        st.write("Nhập số dư ban đầu cho ví:")
+        st.write("Nhập số dư ban đầu cho ví (nhập kiểu **20.000.000**):")
         df = get_accounts(uid)
         try:
             cash_id = int(df[df["type"]=="cash"]["id"].iloc[0])
@@ -627,9 +673,12 @@ def onboarding_wizard(uid):
             st.error("Không tìm thấy ví mặc định. Hãy đăng xuất và đăng ký lại.")
             return
         c1,c2 = st.columns(2)
-        cash = c1.number_input("Tiền mặt (VND)", min_value=0.0, step=50000.0, format="%.0f")
-        bank = c2.number_input("Tài khoản ngân hàng (VND)", min_value=0.0, step=100000.0, format="%.0f")
+        cash_text = c1.text_input("Tiền mặt (VND)", placeholder="VD: 2.000.000")
+        bank_text = c2.text_input("Tài khoản ngân hàng (VND)", placeholder="VD: 8.000.000")
+
         if st.button("Lưu & tiếp tục ➜", type="primary"):
+            cash = parse_vnd_str(cash_text)
+            bank = parse_vnd_str(bank_text)
             execute("UPDATE accounts SET opening_balance=? WHERE id=?", (float(cash), cash_id))
             execute("UPDATE accounts SET opening_balance=? WHERE id=?", (float(bank), bank_id))
             st.session_state.ob_step = 3; st.rerun()
@@ -655,6 +704,7 @@ def onboarding_wizard(uid):
         ok = (not get_categories(uid, "expense").empty) and (not get_categories(uid, "income").empty)
         if st.button("Hoàn tất", type="primary", disabled=(not ok)):
             finish_onboarding(uid); st.success("Xong! Bắt đầu dùng ứng dụng thôi 🎉"); st.rerun()
+
 # =========================
 # Màn hình Đăng nhập / Đăng ký
 # =========================
@@ -736,6 +786,7 @@ def app_shell(uid: int):
         page_settings(uid)
     else:
         page_help(uid)
+
 # =========================
 # Main entry
 # =========================
