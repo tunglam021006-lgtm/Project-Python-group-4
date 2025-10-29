@@ -6,7 +6,7 @@
 import streamlit as st
 import sqlite3, hashlib, pandas as pd, datetime as dt, altair as alt
 from pathlib import Path
-import random, re, unicodedata
+import random, re, unicodedata, io  # <— thêm io để xuất Excel
 
 DB_PATH = "expense.db"
 ENABLE_DEMO = True
@@ -159,7 +159,7 @@ def get_user(uid): return fetchone("SELECT * FROM users WHERE id=?", (uid,))
 def set_user_profile(uid, name): execute("UPDATE users SET display_name=? WHERE id=?", (name.strip(), uid))
 def finish_onboarding(uid): execute("UPDATE users SET onboarded=1 WHERE id=?", (uid,))
 
-# ---------- Seed DEMO: đủ 2023, 2024 + các tháng của năm hiện tại, budgets 12 tháng ----------
+# ---------- Seed DEMO ----------
 def seed_demo_user_once(c):
     if not c.execute("SELECT 1 FROM users WHERE email='demo@expense.local'").fetchone():
         now = dt.datetime.now().isoformat()
@@ -290,7 +290,7 @@ def add_account(uid,name,t,balance):
     execute("INSERT INTO accounts(user_id,name,type,opening_balance,created_at) VALUES(?,?,?,?,?)",
             (uid,name.strip(),t,balance,dt.datetime.now().isoformat()))
 
-# ---------- Table helpers (ẩn ID + sort đúng + STT đánh sau sort) ----------
+# ---------- Table helpers ----------
 META_DROP = {"id","user_id","parent_id","ID","user_id","parent_id"}
 
 def sort_df_for_display(df, sort_col, ascending):
@@ -357,8 +357,12 @@ def page_transactions(uid):
         cat = st.selectbox("Chọn danh mục", (cats_exp["name"] if ttype=="Chi tiêu" else cats_inc["name"]))
         amt_text = st.text_input("Số tiền (VND)", placeholder="VD: 20.000.000")
         notes = st.text_input("Ghi chú (tùy chọn)")
-        date = st.date_input("Ngày giao dịch", value=dt.date.today())
-        time = st.time_input("Giờ giao dịch", value=dt.datetime.now().time().replace(second=0, microsecond=0))
+
+        use_now = st.checkbox("Dùng ngày & giờ hiện tại khi lưu", value=True)
+        if not use_now:
+            date = st.date_input("Ngày giao dịch", value=dt.date.today())
+            time = st.time_input("Giờ giao dịch", value=dt.datetime.now().time().replace(second=0, microsecond=0))
+
         if st.button("Lưu giao dịch", type="primary", use_container_width=True):
             try:
                 amt = parse_vnd_str(amt_text)
@@ -366,8 +370,15 @@ def page_transactions(uid):
                 acc_id = int(accounts[accounts["name"]==acc]["id"].iloc[0])
                 cats_df = (cats_exp if ttype=="Chi tiêu" else cats_inc)
                 cat_id = int(cats_df[cats_df["name"]==cat]["id"].iloc[0])
+
+                occurred_dt = (
+                    dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+                    if use_now else
+                    join_date_time(date, time)
+                )
+
                 add_transaction(uid, acc_id, ("expense" if ttype=="Chi tiêu" else "income"),
-                                cat_id, amt, notes, join_date_time(date, time))
+                                cat_id, amt, notes, occurred_dt)
                 st.success("✅ Giao dịch đã được lưu!")
             except Exception:
                 st.error("Vui lòng nhập số tiền hợp lệ (ví dụ: 20.000.000).")
@@ -463,19 +474,29 @@ def budget_progress_df(uid, d1, d2):
         rows.append({"Danh mục": r["category"], "Đã dùng": used, "Hạn mức": limit, "%": pct})
     return pd.DataFrame(rows)
 
-# FIX: clamp 0..100 để không mất thanh khi vượt 100%
+# FIX + cảnh báo vượt hạn mức
 def budget_progress_chart(df):
     if df.empty:
         st.info("Chưa có hạn mức."); return
+
     df = df.copy()
     df["%"] = pd.to_numeric(df["%"], errors="coerce").fillna(0.0)
+
     def pct_to_color(p):
         p = float(p)
         if p < 70:  return "#22c55e"
         if p < 90:  return "#f59e0b"
         return "#ef4444"
+
     df["__pct_vis"] = df["%"].clip(0, 100)
     df["__color"]   = [pct_to_color(x) for x in df["%"]]
+
+    over = df[df["%"] > 100].copy()
+    if not over.empty:
+        items = [f"{r['Danh mục']} ({r['%']:.0f}% | {format_vnd(r['Đã dùng'])}/{format_vnd(r['Hạn mức'])})"
+                 for _, r in over.iterrows()]
+        st.warning("⚠ Danh mục vượt hạn mức: " + " · ".join(items))
+
     base = alt.Chart(df).encode(y=alt.Y("Danh mục:N", sort='-x', title=None))
     bg = base.mark_bar(color="#33333322").encode(
         x=alt.X("value:Q", title="Đã dùng (%)", scale=alt.Scale(domain=[0, 100]))
@@ -489,7 +510,10 @@ def budget_progress_chart(df):
                  alt.Tooltip("Hạn mức:Q", format=",.0f")]
     )
     txt = base.mark_text(dy=-8).encode(x=alt.X("__pct_vis:Q"), text=alt.Text("%:Q", format=".0f"))
-    st.altair_chart((bg + bar + txt).properties(height=max(220, 28*len(df))), use_container_width=True)
+    warn = base.transform_filter(alt.datum["%"] > 100).mark_text(dy=-8).encode(
+        x=alt.value(100), text=alt.value("⚠")
+    )
+    st.altair_chart((bg + bar + txt + warn).properties(height=max(220, 28*len(df))), use_container_width=True)
 
 # ---------- Pages ----------
 def page_home(uid):
@@ -503,19 +527,16 @@ def page_home(uid):
     st.session_state.filter_end   = c2.date_input("Đến ngày", st.session_state.filter_end)
 
     st.divider()
-    # KPI giữ nguyên theo khoảng ngày gốc
     kpi(uid, st.session_state.filter_start, st.session_state.filter_end)
 
-    # Chế độ hiển thị line chart
     mode = st.radio("Chế độ hiển thị", ["Ngày","Tháng","Năm"], horizontal=True)
     agg_key = {"Ngày":"day","Tháng":"month","Năm":"year"}[mode]
 
-    # Khoảng riêng cho line chart
     chart_d1, chart_d2 = st.session_state.filter_start, st.session_state.filter_end
     if agg_key == "month":
-        chart_d1 = start_months_back(chart_d2, 12)     # 12 tháng gần nhất
+        chart_d1 = start_months_back(chart_d2, 12)
     elif agg_key == "year":
-        chart_d1, chart_d2 = year_window(chart_d2, 5)  # 5 năm gần nhất
+        chart_d1, chart_d2 = year_window(chart_d2, 5)
 
     colA, colB = st.columns([2, 1])
     with colA:
@@ -565,7 +586,7 @@ def page_accounts(uid):
         disp["Số dư hiện tại"] = [format_vnd(current_balance(uid, int(r["id"]))) for _,r in df.iterrows()]
         disp = disp[["Tên","Loại","Tiền tệ","Số dư hiện tại"]]
         render_table(disp, default_sort_col="Số dư hiện tại", default_asc=False, height=320,
-                     key_suffix="accounts", exclude_sort_cols={"Tên"})
+                     key_suffix="accounts", exclude_sort_cols={"Tên", "Loại", "Tiền tệ"})  # chỉ còn Số dư hiện tại
 
     st.markdown("#### Thêm ví mới")
     name = st.text_input("Tên ví (tuỳ chọn)")
@@ -583,9 +604,19 @@ def page_categories(uid):
     else:
         show = df.rename(columns={"name":"Tên","type":"Loại"})
         show["Loại"] = show["Loại"].map(TYPE_LABELS_VN)
-        show = show[["Tên","Loại"]]
-        render_table(show, default_sort_col="Loại", default_asc=True, height=300,
-                     key_suffix="cats", exclude_sort_cols={"Tên"})
+
+        if "cats_filter" not in st.session_state:
+            st.session_state.cats_filter = "Chi tiêu"
+        b1, b2, _ = st.columns([1, 1, 4])
+        if b1.button("🔴 Chỉ Chi tiêu"):
+            st.session_state.cats_filter = "Chi tiêu"
+        if b2.button("🟢 Chỉ Thu nhập"):
+            st.session_state.cats_filter = "Thu nhập"
+
+        filtered = show[show["Loại"] == st.session_state.cats_filter].copy()
+        filtered = filtered[["Tên","Loại"]]
+        render_table(filtered, default_sort_col="Loại", default_asc=True, height=300,
+                     key_suffix="cats", exclude_sort_cols={"Tên","Loại"})  # ẩn dropdown sort hoàn toàn
 
     st.markdown("#### Thêm danh mục")
     cname = st.text_input("Tên danh mục")
@@ -712,9 +743,54 @@ def page_settings(uid):
     df = list_transactions(uid)
     if df.empty:
         st.info("Chưa có dữ liệu để tải.")
-    else:
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Tải transactions.csv", csv, file_name="transactions.csv", mime="text/csv")
+        return
+
+    # Chuẩn hóa dữ liệu tải về: bỏ 2 cột đầu, thêm "Ngày giao dịch", header tiếng Việt
+    df = df.drop(columns=["id", "type"], errors="ignore").copy()
+    df["Ngày giao dịch"] = pd.to_datetime(df["occurred_at"], errors="coerce").dt.date.astype(str)
+
+    rename_map = {
+        "account": "Ví / Tài khoản",
+        "category": "Danh mục",
+        "amount": "Số tiền (VND)",
+        "currency": "Tiền tệ",
+        "notes": "Ghi chú",
+        "tags": "Thẻ",
+        "merchant": "Nơi chi tiêu",
+    }
+    df = df.rename(columns=rename_map)
+    # Sắp xếp cột theo thứ tự mong muốn
+    order = ["Ngày giao dịch", "Ví / Tài khoản", "Danh mục", "Số tiền (VND)", "Tiền tệ", "Ghi chú", "Thẻ", "Nơi chi tiêu"]
+    df = df[[c for c in order if c in df.columns]]
+
+    # CSV có BOM để Excel đọc đúng tiếng Việt
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Tải transactions.csv", csv_bytes, file_name="transactions.csv", mime="text/csv")
+
+    # Xuất Excel .xlsx (tự giãn cột)
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf) as writer:
+            df.to_excel(writer, index=False, sheet_name="transactions")
+            ws = writer.sheets["transactions"]
+            for i, col in enumerate(df.columns):
+                width = max(12, min(40, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
+                try:
+                    ws.set_column(i, i, width)  # xlsxwriter
+                except Exception:
+                    try:
+                        from openpyxl.utils import get_column_letter
+                        ws.column_dimensions[get_column_letter(i+1)].width = width
+                    except Exception:
+                        pass
+        st.download_button(
+            "Tải transactions.xlsx",
+            buf.getvalue(),
+            file_name="transactions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception:
+        st.caption("Không tạo được file .xlsx (thiếu engine). Vẫn có thể dùng CSV (UTF-8 BOM).")
 
 # ---------- Shell ----------
 def screen_login():
