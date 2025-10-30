@@ -6,7 +6,7 @@
 import streamlit as st
 import sqlite3, hashlib, pandas as pd, datetime as dt, altair as alt
 from pathlib import Path
-import random, re, unicodedata, io
+import random, re, unicodedata, io, math  # <-- thêm math
 from typing import Tuple
 
 DB_PATH = "expense.db"
@@ -688,12 +688,18 @@ def pie_by_category(uid, d1, d2, group_parent=True):
         use_container_width=True
     )
 
+# ----------- BUDGETS: % đúng thực, auto-scale, 2 chế độ hiển thị -----------
 def budget_progress_df(uid, d1, d2):
+    """
+    Trả về DataFrame: Danh mục | Đã dùng | Hạn mức | %
+    - % KHÔNG bị cắt, hiển thị đúng giá trị thực (có thể > 100, 200, 300%…)
+    """
     b = get_df("""SELECT b.id, b.category_id, c.name AS category, b.amount, b.start_date, b.end_date
                   FROM budgets b JOIN categories c ON c.id=b.category_id
                   WHERE b.user_id=? AND date(b.end_date)>=date(?) AND date(b.start_date)<=date(?)
                   ORDER BY b.start_date DESC""", (uid, str(d1), str(d2)))
-    if b.empty: return b
+    if b.empty: 
+        return b
     rows=[]
     for _,r in b.iterrows():
         s = max(pd.to_datetime(str(r["start_date"])).date(), d1)
@@ -704,73 +710,69 @@ def budget_progress_df(uid, d1, d2):
                          (uid, int(r["category_id"]), str(s), str(e)))
         used = float(spent["s"] or 0.0)
         limit = float(r["amount"])
-        pct = 0.0 if limit<=0 else min(100.0*used/limit, 200.0)
+        pct = 0.0 if limit<=0 else (100.0*used/limit)   # <-- KHÔNG CLIP
         rows.append({"Danh mục": r["category"], "Đã dùng": used, "Hạn mức": limit, "%": pct})
     return pd.DataFrame(rows)
 
-def budget_progress_chart(df):
+def budget_progress_chart(df, title: str = "Tiến độ hạn mức"):
+    """
+    Vẽ bar ngang với trục X tự co giãn theo % lớn nhất.
+    Màu: <90% xanh, 90–100% vàng, >100% đỏ.
+    """
     if df is None or df.empty:
-        st.info("Chưa có hạn mức."); 
+        st.info("Chưa có hạn mức.")
         return
 
-    # Chuẩn hoá dữ liệu hiển thị
-    df = df.copy()
-    df["%"] = pd.to_numeric(df["%"], errors="coerce").fillna(0.0)
+    d = df.copy()
+    d["%"] = pd.to_numeric(d["%"], errors="coerce").fillna(0.0)
+
+    # domain trục X: làm tròn lên bội 10 để nhìn đẹp
+    max_pct = max(100.0, float(d["%"].max()))
+    domain_right = int(math.ceil(max_pct / 10.0) * 10)
 
     def pct_to_color(p):
         p = float(p)
-        if p < 70:  return "#22c55e"   # xanh
-        if p < 90:  return "#f59e0b"   # vàng
-        return "#ef4444"               # đỏ
+        if p < 90:
+            return "#22c55e"   # xanh
+        if p <= 100:
+            return "#f59e0b"   # vàng
+        return "#ef4444"       # đỏ
 
-    # Cột dùng để vẽ (clip <= 100), và cột nhãn hiển thị (giá trị thật)
-    df["__pct_vis"] = df["%"].clip(0, 100)
-    df["__color"]   = [pct_to_color(x) for x in df["%"]]
-    df["__label"]   = df["%"].map(lambda x: f"{x:.0f}%")
-    # Đẩy nhãn lệch 1 đơn vị để không chạm mép phải khi = 100
-    df["__label_x"] = (df["__pct_vis"] + 1).clip(0, 105)
+    d["__color"] = [pct_to_color(x) for x in d["%"]]
 
-    base = alt.Chart(df).encode(
+    base = alt.Chart(d).encode(
         y=alt.Y("Danh mục:N", sort='-x', title=None)
     )
 
-    # Thanh nền 100%
-    bg = base.mark_bar(color="#33333322").encode(
-        x=alt.X("value:Q", title="Đã dùng (%)",
-                scale=alt.Scale(domain=[0, 105]))  # chừa lề phải
-    ).transform_calculate(value="100")
-
-    # Thanh tiến độ (clip <= 100)
-    bar = base.mark_bar(clip=True).encode(
-        x=alt.X("__pct_vis:Q", title="Đã dùng (%)",
-                scale=alt.Scale(domain=[0, 105])),
+    bars = base.mark_bar().encode(
+        x=alt.X("%:Q", title="Đã dùng (%)", scale=alt.Scale(domain=[0, domain_right])),
         color=alt.Color("__color:N", legend=None, scale=None),
         tooltip=[
             alt.Tooltip("Danh mục:N"),
             alt.Tooltip("%:Q", format=".0f", title="Đã dùng (%)"),
             alt.Tooltip("Đã dùng:Q", format=",.0f"),
-            alt.Tooltip("Hạn mức:Q", format=",.0f")
-        ]
+            alt.Tooltip("Hạn mức:Q", format=",.0f"),
+        ],
     )
 
-    # Nhãn phần trăm: căn trái + đẩy nhẹ sang phải để 100% không bị cắt
-    txt = base.mark_text(align="left", dx=6).encode(
-        x=alt.X("__label_x:Q", scale=alt.Scale(domain=[0, 105])),
-        text=alt.Text("__label:N")
+    labels = base.mark_text(align="left", dx=4).encode(
+        x=alt.X("%:Q", scale=alt.Scale(domain=[0, domain_right])),
+        text=alt.Text("%:Q", format=".0f")
     )
 
-    height = max(220, 28 * len(df))
-    st.altair_chart((bg + bar + txt).properties(height=height),
-                    use_container_width=True)
+    st.markdown(f"#### {title}")
+    st.altair_chart((bars + labels).properties(height=max(220, 28*len(d))), use_container_width=True)
 
-    # Cảnh báo vượt hạn mức
-    over = df[df["%"] > 100]
+    # Banner cảnh báo
+    over = d[d["%"] > 100]
     if not over.empty:
-        items = [f"{r['Danh mục']} ({r['%']:.0f}% | "
-                 f"{format_vnd(r['Đã dùng'])}/{format_vnd(r['Hạn mức'])})"
-                 for _, r in over.iterrows()]
+        items = [
+            f"{r['Danh mục']} ({r['%']:.0f}% | {format_vnd(r['Đã dùng'])}/{format_vnd(r['Hạn mức'])})"
+            for _, r in over.iterrows()
+        ]
         st.warning("⚠ Danh mục vượt hạn mức: " + " · ".join(items))
 
+# ----------------- HOME -----------------
 def page_home(uid):
     st.subheader("🏠 Trang chủ")
 
@@ -833,7 +835,13 @@ def page_home(uid):
     st.divider()
     st.markdown("#### Tiến độ hạn mức")
     dfb = budget_progress_df(uid, cur_start, cur_end)
-    budget_progress_chart(dfb)
+    # Trang chủ: chỉ hiện các hạn mức sắp chạm/vượt (>= 90%)
+    near_threshold = 90.0
+    df_alert = dfb[dfb["%"] >= near_threshold] if dfb is not None and not dfb.empty else dfb
+    if df_alert is None or df_alert.empty:
+        st.success("🎉 Chưa có danh mục nào gần chạm hoặc vượt hạn mức.")
+    else:
+        budget_progress_chart(df_alert, title="Tiến độ hạn mức (gần chạm/vượt)")
 
     st.divider()
     st.markdown("#### Giao dịch gần đây")
@@ -846,7 +854,6 @@ def page_home(uid):
         df = df.drop(columns=[c for c in df.columns if c in META_DROP], errors="ignore")
         df.insert(0, "STT", range(1, len(df)+1))
         st.dataframe(df.head(10), use_container_width=True, height=260, hide_index=True)
-
 
 def current_balance(uid, account_id):
     r = fetchone("""SELECT
@@ -997,6 +1004,13 @@ def page_budgets(uid):
         df["Hạn mức (VND)"] = df["Hạn mức (VND)"].map(format_vnd)
         render_table(df, default_sort_col="Từ ngày", default_asc=False, height=260, key_suffix="budgets",
                      exclude_sort_cols=set())
+
+    # Biểu đồ FULL tất cả hạn mức (lấy khoảng ngày chung nếu có, mặc định tháng này -> hôm nay)
+    st.divider()
+    chart_start = st.session_state.get("filter_start", dt.date.today().replace(day=1))
+    chart_end   = st.session_state.get("filter_end", dt.date.today())
+    df_all = budget_progress_df(uid, chart_start, chart_end)
+    budget_progress_chart(df_all, title="Tiến độ hạn mức (tất cả)")
 
 def page_reports(uid):
     render_inline_notice()
