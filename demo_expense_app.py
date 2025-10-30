@@ -1,12 +1,13 @@
 # ==========================================
 # Expense Manager (Streamlit + SQLite)
-# Bản đã hợp nhất toàn bộ yêu cầu
+# Bản đã hợp nhất & chỉnh sửa theo yêu cầu mới
 # ==========================================
 
 import streamlit as st
 import sqlite3, hashlib, pandas as pd, datetime as dt, altair as alt
 from pathlib import Path
-import random, re, unicodedata, io  # <— thêm io để xuất Excel
+import random, re, unicodedata, io
+from typing import Tuple
 
 DB_PATH = "expense.db"
 ENABLE_DEMO = True
@@ -19,9 +20,13 @@ def format_vnd(n):
         return str(n)
 
 def parse_vnd_str(s):
+    """
+    Cho phép nhập có dấu chấm/phẩy/khoảng trắng.
+    Ví dụ: '5.000.000' -> 5000000.0
+    """
     if s is None:
         return 0.0
-    digits = re.sub(r"[^\d-]", "", str(s))
+    digits = re.sub(r"[^\d]", "", str(s))
     try:
         return float(digits) if digits else 0.0
     except Exception:
@@ -36,17 +41,54 @@ def strip_accents_lower(s):
     s = unicodedata.normalize("NFD", str(s))
     return "".join(ch for ch in s if unicodedata.category(ch) != "Mn").lower()
 
-# NEW: khoảng hiển thị cho mode Tháng/Năm
+# ==== Notices (thông báo đứng lại đủ lâu) ====
+def show_notice(msg: str, level: str = "success"):
+    """Ghim notice (success/info/error) cho lần render hiện tại."""
+    st.session_state["__inline_notice__"] = (msg, level)
+
+def render_inline_notice():
+    """Hiển thị notice nếu có và tự clear ở lần rerun kế tiếp."""
+    note = st.session_state.pop("__inline_notice__", None)
+    if note:
+        msg, level = note
+        if level == "error":
+            st.error(msg)
+        elif level == "info":
+            st.info(msg)
+        else:
+            st.success(msg)
+
+def _toast_ok(msg: str):
+    # Streamlit toast không chỉnh thời lượng -> kết hợp toast + inline notice
+    try:
+        st.toast(msg)
+    except Exception:
+        pass
+    show_notice(msg, "success")
+
+# Ô nhập tiền có auto chèn dấu chấm
+def money_input(label: str, key: str, placeholder: str = "VD: 5.000.000"):
+    raw = st.text_input(label, key=key, placeholder=placeholder)
+    cleaned = re.sub(r"[^\d]", "", raw or "")
+    if cleaned and raw and raw != "." and cleaned != raw.replace(".", ""):
+        pretty = f"{int(cleaned):,}".replace(",", ".")
+        st.session_state[key] = pretty
+    return parse_vnd_str(st.session_state.get(key, raw))
+
+# Khoảng hiển thị cho Tháng/Năm/Tuần
 def start_months_back(end_date: dt.date, months: int) -> dt.date:
     idx = end_date.year * 12 + (end_date.month - 1) - (months - 1)
     y0 = idx // 12
     m0 = idx % 12 + 1
     return dt.date(y0, m0, 1)
 
-def year_window(end_date: dt.date, years: int) -> tuple[dt.date, dt.date]:
+def year_window(end_date: dt.date, years: int):
     y2 = end_date.year
     y1 = y2 - (years - 1)
     return dt.date(y1, 1, 1), dt.date(y2, 12, 31)
+
+def start_weeks_back(end_date: dt.date, weeks: int) -> dt.date:
+    return end_date - dt.timedelta(days=7*(weeks-1))
 
 # ---------- DB ----------
 def get_conn():
@@ -193,7 +235,7 @@ def seed_demo_user_once(c):
 
     def add_month_data(y, m):
         month_mid = dt.date(y, m, 15)
-        for _ in range(random.randint(6, 8)):  # incomes
+        for _ in range(random.randint(3, 5)):  # incomes
             cat = random.choice(inc_ids)
             amt = random.choice([random.randint(6_000_000, 18_000_000),
                                  random.randint(500_000, 2_000_000)])
@@ -217,17 +259,15 @@ def seed_demo_user_once(c):
                          VALUES(?,?,?,?,?,?,?,?)""",
                       (uid, random.choice(acc_ids), "expense", cat, amt, "VND", occurred, now))
 
-    # regenerate demo txs
     c.execute("DELETE FROM transactions WHERE user_id=?", (uid,))
     for y in (2023, 2024):
-        for m in range(1, 13):
+        for m in range(1, 12+1):
             add_month_data(y, m)
     today = dt.date.today()
-    for m in range(1, today.month + 1):  # năm hiện tại đến tháng hiện tại
+    for m in range(1, today.month + 1):
         add_month_data(today.year, m)
     c.commit()
 
-    # budgets 12 tháng gần nhất
     cats_map = {r["name"]: r["id"] for r in c.execute(
         "SELECT id,name FROM categories WHERE user_id=? AND type='expense'", (uid,)
     ).fetchall()}
@@ -251,7 +291,7 @@ def seed_demo_user_once(c):
 TYPE_LABELS_VN = {"expense":"Chi tiêu", "income":"Thu nhập"}
 COLOR_INCOME = "#2ecc71"
 COLOR_EXPENSE = "#ff6b6b"
-COLOR_NET = "#06b6d4"   # Net dùng 1 màu cố định
+COLOR_NET = "#06b6d4"
 
 def list_transactions(uid, d1=None, d2=None):
     q = """SELECT t.id, t.occurred_at, t.type, t.amount, t.currency,
@@ -262,7 +302,7 @@ def list_transactions(uid, d1=None, d2=None):
     p=[uid]
     if d1: q+=" AND date(t.occurred_at)>=date(?)"; p.append(str(d1))
     if d2: q+=" AND date(t.occurred_at)<=date(?)"; p.append(str(d2))
-    q += " ORDER BY t.occurred_at DESC"
+    q += " ORDER BY t.occurred_at DESC, t.id DESC"
     return get_df(q, tuple(p))
 
 def df_tx_vi(df):
@@ -281,116 +321,152 @@ def get_categories(uid, t=None):
     q="SELECT * FROM categories WHERE user_id=?"; p=[uid]
     if t: q+=" AND type=?"; p.append(t)
     q+=" ORDER BY name"; return get_df(q, tuple(p))
+
 def add_transaction(uid, account_id, ttype, cat_id, amount, notes, occurred_dt):
     execute("""INSERT INTO transactions(user_id,account_id,type,category_id,amount,currency,occurred_at,created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
             (uid,account_id,ttype,cat_id,amount,"VND",occurred_dt,dt.datetime.now().isoformat()))
-def add_category(uid,name,t): execute("INSERT INTO categories(user_id,name,type) VALUES(?,?,?)",(uid,name.strip(),t))
+
+def add_category(uid,name,t,parent_id=None):
+    execute("INSERT INTO categories(user_id,name,type,parent_id) VALUES(?,?,?,?)",(uid,name.strip(),t,parent_id))
+
 def add_account(uid,name,t,balance):
     execute("INSERT INTO accounts(user_id,name,type,opening_balance,created_at) VALUES(?,?,?,?,?)",
             (uid,name.strip(),t,balance,dt.datetime.now().isoformat()))
 
-# ---------- Table helpers ----------
+def delete_transaction(uid, tx_id: int):
+    execute("DELETE FROM transactions WHERE user_id=? AND id=?", (uid, int(tx_id)))
+
+def delete_budget(uid, bid: int):
+    execute("DELETE FROM budgets WHERE user_id=? AND id=?", (uid, int(bid)))
+
+def delete_category(uid, cid: int):
+    # Xoá budgets liên quan, set NULL category_id cho transactions, set NULL parent của con
+    execute("DELETE FROM budgets WHERE user_id=? AND category_id=?", (uid, int(cid)))
+    execute("UPDATE transactions SET category_id=NULL WHERE user_id=? AND category_id=?", (uid, int(cid)))
+    execute("UPDATE categories SET parent_id=NULL WHERE user_id=? AND parent_id=?", (uid, int(cid)))
+    execute("DELETE FROM categories WHERE user_id=? AND id=?", (uid, int(cid)))
+
+# ---------- Table helpers (ẩn ID + sort đúng + STT đánh sau sort) ----------
 META_DROP = {"id","user_id","parent_id","ID","user_id","parent_id"}
 
-def sort_df_for_display(df, sort_col, ascending):
+def _detect_sort_kind(df: pd.DataFrame, col: str) -> str:
+    if col == "Loại":
+        return "type"
+    if col in ("Thời điểm","Ngày giao dịch","Từ ngày","Đến ngày"):
+        return "time"
+    norm = strip_accents_lower(col)
+    if any(k in norm for k in ["tien","dư","du","muc","hạn","han","so"]):
+        return "number"
+    return "text"
+
+def _type_key_series(s: pd.Series) -> pd.Series:
+    def to_key(x: str) -> int:
+        x = str(x)
+        x = x.replace("🟢","").replace("🔴","").strip()
+        x_no = strip_accents_lower(x)
+        if "chi tieu" in x_no:
+            return 0
+        if "thu nhap" in x_no:
+            return 1
+        return 2
+    return s.astype(str).map(to_key)
+
+def sort_df_for_display(df: pd.DataFrame, sort_col: str, ascending: bool):
     if df is None or df.empty or sort_col not in df.columns:
         return df
-    s = df[sort_col]
-    if sort_col in ("Thời điểm","Từ ngày","Đến ngày"):
-        key = pd.to_datetime(s, errors="coerce")
+    kind = _detect_sort_kind(df, sort_col)
+    if kind == "type":
+        key_func = _type_key_series
+        ascending = True
+    elif kind == "time":
+        key_func = lambda s: pd.to_datetime(s, errors="coerce")
+    elif kind == "number":
+        key_func = lambda s: pd.to_numeric(
+            s.astype(str).str.replace(".","",regex=False).str.replace(",","",regex=False).str.strip(),
+            errors="coerce"
+        ).fillna(0.0)
     else:
-        norm_name = strip_accents_lower(sort_col)
-        if ("tien" in norm_name) or ("du" in norm_name):  # 'Số tiền', 'Số dư ...'
-            key = (s.astype(str)
-                     .str.replace(".","",regex=False)
-                     .str.replace(",","",regex=False)
-                     .str.strip()
-                     .astype("float64"))
-        else:
-            key = s.astype(str).map(strip_accents_lower)
-    return df.iloc[key.sort_values(ascending=ascending).index]
+        key_func = lambda s: s.astype(str).map(strip_accents_lower)
+    return df.sort_values(by=sort_col, ascending=ascending, key=key_func, kind="mergesort")
 
-def render_table(df: pd.DataFrame,
-                 default_sort_col: str | None = None,
-                 default_asc: bool = False,
-                 height: int = 320,
-                 key_suffix: str = "",
-                 exclude_sort_cols: set[str] | None = None):
+def render_table(
+    df: pd.DataFrame,
+    default_sort_col: str | None = None,
+    default_asc: bool = False,
+    height: int = 320,
+    key_suffix: str = "",
+    exclude_sort_cols: set[str] | None = None,
+    show_type_filters: bool = True,
+    show_sort: bool = True,
+):
     if df is None or df.empty:
-        st.info("Chưa có dữ liệu."); return
+        st.info("Chưa có dữ liệu.")
+        return
+
     df = df.drop(columns=[c for c in df.columns if c in META_DROP], errors="ignore").copy()
+
+    # Lọc theo 'Loại' (nếu cho phép)
+    if show_type_filters and ("Loại" in df.columns):
+        state_key = f"filter_{key_suffix}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = "Tất cả"
+
+        b_all, b_exp, b_inc = st.columns([1, 1, 1])
+        if b_all.button("⚪ Tất cả", key=f"all_{key_suffix}"):
+            st.session_state[state_key] = "Tất cả"
+        if b_exp.button("🔴 Chỉ Chi tiêu", key=f"exp_{key_suffix}"):
+            st.session_state[state_key] = "Chi tiêu"
+        if b_inc.button("🟢 Chỉ Thu nhập", key=f"inc_{key_suffix}"):
+            st.session_state[state_key] = "Thu nhập"
+
+        pick = st.session_state[state_key]
+        if pick != "Tất cả":
+            df = df[df["Loại"].astype(str).str.contains(pick, case=False, na=False)]
+
+    # Không hiển thị UI sắp xếp
+    if not show_sort:
+        df_show = df.copy()
+        df_show.insert(0, "STT", range(1, len(df_show) + 1))
+        st.dataframe(df_show, use_container_width=True, height=height, hide_index=True)
+        return
+
     cols = [c for c in df.columns if (exclude_sort_cols is None or c not in exclude_sort_cols)]
     if not cols:
-        df.insert(0, "STT", range(1, len(df)+1))
+        df.insert(0, "STT", range(1, len(df) + 1))
         st.dataframe(df, use_container_width=True, height=height, hide_index=True)
         return
-    c1,c2,_ = st.columns([1.6,1,2])
+
+    c1, c2, _ = st.columns([1.6, 1.2, 2])
     idx = cols.index(default_sort_col) if default_sort_col in cols else 0
     sort_col = c1.selectbox("Sắp xếp theo", cols, index=idx, key=f"sort_{key_suffix}")
-    order = c2.radio("Thứ tự", ["Giảm dần","Tăng dần"], horizontal=True, key=f"order_{key_suffix}")
-    df_sorted = sort_df_for_display(df, sort_col, ascending=(order=="Tăng dần"))
-    df_sorted.insert(0, "STT", range(1, len(df_sorted)+1))
+    kind = _detect_sort_kind(df, sort_col)
+
+    if kind == "type":
+        st.caption("Thứ tự 'Loại' cố định: Chi tiêu → Thu nhập")
+        ascending = True
+    else:
+        if kind == "time":
+            labels = ["Mới nhất", "Cũ nhất"]
+        elif kind == "number":
+            labels = ["Cao → Thấp", "Thấp → Cao"]
+        else:
+            labels = ["A → Z", "Z → A"]
+
+        pick = c2.radio("Thứ tự", labels, horizontal=True, key=f"order_{key_suffix}")
+        if labels == ["Mới nhất", "Cũ nhất"]:
+            ascending = (pick == "Cũ nhất")
+        elif labels == ["Cao → Thấp", "Thấp → Cao"]:
+            ascending = (pick == "Thấp → Cao")
+        else:
+            ascending = (pick == "A → Z")
+
+    df_sorted = sort_df_for_display(df, sort_col, ascending)
+    df_sorted.insert(0, "STT", range(1, len(df_sorted) + 1))
     st.dataframe(df_sorted, use_container_width=True, height=height, hide_index=True)
 
-# ---------- UI parts ----------
-def colored_form_css(kind):
-    color = COLOR_EXPENSE if kind=="Chi tiêu" else COLOR_INCOME
-    st.markdown(f"""
-    <style>
-      div[data-testid="stExpander"] > details {{ border: 1px solid {color}55; border-radius: 12px; }}
-      div[data-testid="stExpander"] summary:hover {{ background-color: {color}1A; }}
-      button[kind="primary"] {{ background-color: {color} !important; border-color: {color} !important; }}
-    </style>
-    """, unsafe_allow_html=True)
-
-def page_transactions(uid):
-    st.subheader("🧾 Giao dịch")
-    accounts = get_accounts(uid)
-    cats_exp = get_categories(uid, "expense")
-    cats_inc = get_categories(uid, "income")
-
-    with st.expander("➕ Thêm giao dịch mới", expanded=True):
-        ttype = st.radio("Loại giao dịch", ["Chi tiêu","Thu nhập"], horizontal=True)
-        colored_form_css(ttype)
-        acc = st.selectbox("Chọn ví/tài khoản", accounts["name"])
-        cat = st.selectbox("Chọn danh mục", (cats_exp["name"] if ttype=="Chi tiêu" else cats_inc["name"]))
-        amt_text = st.text_input("Số tiền (VND)", placeholder="VD: 20.000.000")
-        notes = st.text_input("Ghi chú (tùy chọn)")
-
-        use_now = st.checkbox("Dùng ngày & giờ hiện tại khi lưu", value=True)
-        if not use_now:
-            date = st.date_input("Ngày giao dịch", value=dt.date.today())
-            time = st.time_input("Giờ giao dịch", value=dt.datetime.now().time().replace(second=0, microsecond=0))
-
-        if st.button("Lưu giao dịch", type="primary", use_container_width=True):
-            try:
-                amt = parse_vnd_str(amt_text)
-                if amt <= 0: st.error("Số tiền phải lớn hơn 0."); st.stop()
-                acc_id = int(accounts[accounts["name"]==acc]["id"].iloc[0])
-                cats_df = (cats_exp if ttype=="Chi tiêu" else cats_inc)
-                cat_id = int(cats_df[cats_df["name"]==cat]["id"].iloc[0])
-
-                occurred_dt = (
-                    dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
-                    if use_now else
-                    join_date_time(date, time)
-                )
-
-                add_transaction(uid, acc_id, ("expense" if ttype=="Chi tiêu" else "income"),
-                                cat_id, amt, notes, occurred_dt)
-                st.success("✅ Giao dịch đã được lưu!")
-            except Exception:
-                st.error("Vui lòng nhập số tiền hợp lệ (ví dụ: 20.000.000).")
-
-    st.divider()
-    st.write("### 📊 Danh sách giao dịch")
-    df = df_tx_vi(list_transactions(uid))
-    if df is not None and not df.empty and "Loại" in df.columns:
-        df["Loại"] = df["Loại"].map({"Thu nhập":"🟢 Thu nhập","Chi tiêu":"🔴 Chi tiêu"}).fillna(df["Loại"])
-    render_table(df, default_sort_col="Thời điểm", default_asc=False, height=380, key_suffix="tx_list")
-
-def kpi(uid, d1, d2):
+# ---------- Aggregations & Delta ----------
+def period_sum(uid:int, d1:dt.date, d2:dt.date) -> Tuple[float,float,float]:
     r = fetchone("""
         SELECT
           COALESCE(SUM(CASE WHEN type='income'  THEN amount END),0) AS income,
@@ -399,57 +475,215 @@ def kpi(uid, d1, d2):
         WHERE user_id=? AND date(occurred_at) BETWEEN date(?) AND date(?)""",
         (uid, str(d1), str(d2)))
     income, expense = float(r["income"] or 0), float(r["expense"] or 0)
-    net = income - expense
+    return income, expense, (income-expense)
 
-    c1,c2,c3 = st.columns(3)
-    c1.markdown(f"<div style='color:#888'>Tổng thu</div>"
-                f"<div style='color:{COLOR_INCOME};font-weight:700;font-size:1.6rem'>{format_vnd(income)} VND</div>",
-                unsafe_allow_html=True)
-    c2.markdown(f"<div style='color:#888'>Tổng chi</div>"
-                f"<div style='color:{COLOR_EXPENSE};font-weight:700;font-size:1.6rem'>{format_vnd(expense)} VND</div>",
-                unsafe_allow_html=True)
-    c3.markdown(f"<div style='color:#888'>Net (thu - chi)</div>"
-                f"<div style='color:{COLOR_NET};font-weight:700;font-size:1.6rem'>{format_vnd(net)} VND</div>",
-                unsafe_allow_html=True)
+def previous_period(d1:dt.date, d2:dt.date, mode:str) -> Tuple[dt.date,dt.date]:
+    # khoảng KPI luôn theo đúng "Từ ngày" - "Đến ngày" đang chọn, chỉ giai đoạn trước phụ thuộc mode để so sánh
+    if mode=="day":
+        span = (d2 - d1).days + 1
+        return d1 - dt.timedelta(days=span), d2 - dt.timedelta(days=span)
+    if mode=="week":
+        return d1 - dt.timedelta(days=7), d2 - dt.timedelta(days=7)
+    if mode=="month":
+        y = d1.year; m = d1.month
+        first_this = dt.date(y, m, 1)
+        prev_last = first_this - dt.timedelta(days=1)
+        prev_first = dt.date(prev_last.year, prev_last.month, 1)
+        return prev_first, prev_last
+    # year
+    return dt.date(d1.year-1,1,1), dt.date(d1.year-1,12,31)
 
-def query_agg(uid, d1, d2, mode):
+def query_agg_expense(uid, d1, d2, mode):
     if mode=="day":
         g="date(occurred_at)"; label="Ngày"; xtype="T"
+    elif mode=="week":
+        g="strftime('%Y-%W', occurred_at)"; label="Tuần"; xtype="O"
     elif mode=="month":
         g="strftime('%Y-%m', occurred_at)"; label="Tháng"; xtype="O"
     else:
         g="strftime('%Y', occurred_at)"; label="Năm"; xtype="O"
-    df = get_df(f"""SELECT {g} AS label,
-                           SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) AS Chi_tiêu
-                    FROM transactions
-                    WHERE user_id=? AND date(occurred_at) BETWEEN date(?) AND date(?)
-                    GROUP BY {g} ORDER BY {g}""", (uid, str(d1), str(d2)))
+    df = get_df(f"""
+        SELECT {g} AS label,
+               SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) AS Chi_tieu
+        FROM transactions
+        WHERE user_id=? AND date(occurred_at) BETWEEN date(?) AND date(?)
+        GROUP BY {g} ORDER BY {g}
+    """, (uid, str(d1), str(d2)))
+    if df.empty:
+        df = pd.DataFrame(columns=[label,"Chi_tieu"])
     df = df.rename(columns={"label": label})
     return df, label, xtype
 
-def spending_chart(uid, d1, d2, mode):
-    df, label, xtype = query_agg(uid, d1, d2, mode)
+# ---------- Category tree helpers ----------
+def build_category_tree(uid:int, ctype:str):
+    df = get_df("SELECT id,name,parent_id FROM categories WHERE user_id=? AND type=? ORDER BY name",(uid,ctype))
+    by_parent = {}
+    for _,r in df.iterrows():
+        pid = int(r["parent_id"]) if pd.notna(r["parent_id"]) else None
+        by_parent.setdefault(pid, []).append({"id": int(r["id"]), "name": r["name"]})
+    parents = by_parent.get(None, [])
+    for p in parents:
+        p["children"] = sorted(by_parent.get(p["id"], []), key=lambda x: strip_accents_lower(x["name"]))
+    orphans = []
+    return parents, orphans
+
+# ---------- Pages ----------
+def page_transactions(uid):
+    st.subheader("🧾 Thêm giao dịch mới")
+    accounts = get_accounts(uid)
+    if accounts.empty:
+        st.warning("⚠️ Vui lòng tạo ít nhất 1 tài khoản trước khi thêm giao dịch.")
+        return
+
+    # Loại giao dịch
+    ttype_vi = st.radio("Loại giao dịch", ["Chi tiêu","Thu nhập"], horizontal=True)
+    ttype = "expense" if ttype_vi == "Chi tiêu" else "income"
+
+    # Lấy toàn bộ danh mục theo loại
+    cats_all = get_categories(uid, ttype)
+    if cats_all.empty:
+        st.warning("⚠️ Chưa có danh mục phù hợp. Hãy tạo danh mục ở mục 🏷 trước.")
+        return
+
+    # --- Danh mục cha (parent_id IS NULL) ---
+    parents = cats_all[cats_all["parent_id"].isna()].copy().sort_values("name")
+    parent_name = st.selectbox("Danh mục", parents["name"])
+    parent_id = int(parents.loc[parents["name"] == parent_name, "id"].iloc[0])
+
+    # --- Danh mục con của danh mục cha đã chọn ---
+    children = cats_all[cats_all["parent_id"] == parent_id].copy().sort_values("name")
+    child_label = ["(Không)"] + (children["name"].tolist() if not children.empty else [])
+    child_pick = st.selectbox("Danh mục con (nếu có)", child_label, index=0)
+
+    # Quyết định category_id để ghi vào DB
+    if child_pick == "(Không)" or children.empty:
+        category_id = parent_id
+    else:
+        category_id = int(children.loc[children["name"] == child_pick, "id"].iloc[0])
+
+    # --- Ví/Tài khoản ---
+    acc_name = st.selectbox("Chọn ví/tài khoản", accounts["name"])
+    acc_id = int(accounts.loc[accounts["name"] == acc_name, "id"].iloc[0])
+
+    # --- Số tiền & ghi chú ---
+    amt = money_input("💰 Số tiền (VND)", key="add_tx_amount", placeholder="VD: 5.000.000")
+    notes = st.text_input("📝 Ghi chú (tùy chọn)")
+
+    # --- Thời gian ---
+    use_now = st.checkbox("Dùng thời gian hiện tại", value=True)
+    if use_now:
+        occurred_dt = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    else:
+        date = st.date_input("Ngày giao dịch", value=dt.date.today())
+        time = st.time_input("Giờ giao dịch", value=dt.datetime.now().time().replace(second=0, microsecond=0))
+        occurred_dt = join_date_time(date, time)
+
+    # --- Lưu ---
+    if st.button("💾 Lưu giao dịch", type="primary", use_container_width=True):
+        try:
+            if amt <= 0:
+                st.error("Số tiền phải lớn hơn 0.")
+                st.stop()
+            add_transaction(uid, acc_id, ttype, category_id, amt, notes, occurred_dt)
+            _toast_ok("✅ Đã thêm giao dịch thành công")
+            st.session_state["add_tx_amount"] = ""
+        except Exception as e:
+            st.error(f"Lưu thất bại. Vui lòng kiểm tra lại dữ liệu. ({e})")
+
+# ---------- Stable KPI cache ----------
+def _kpi_cache_get(uid: int, d1: dt.date, d2: dt.date):
+    key = f"kpi::{uid}::{str(d1)}::{str(d2)}"
+    if "_kpi_cache" not in st.session_state:
+        st.session_state._kpi_cache = {}
+    return st.session_state._kpi_cache.get(key)
+
+def _kpi_cache_set(uid: int, d1: dt.date, d2: dt.date, val: tuple[float,float,float]):
+    key = f"kpi::{uid}::{str(d1)}::{str(d2)}"
+    st.session_state._kpi_cache[key] = val
+
+def kpi(uid, d1, d2, mode):
+    """
+    - Tổng thu/chi/chênh lệch CHỈ phụ thuộc [d1, d2]
+    - Chỉ phần 'so với kỳ trước' phụ thuộc 'mode'
+    - Có cache theo (uid, d1, d2) để không nhảy số khi re-run
+    """
+    cached = _kpi_cache_get(uid, d1, d2)
+    if cached is None:
+        income, expense, net = period_sum(uid, d1, d2)
+        _kpi_cache_set(uid, d1, d2, (income, expense, net))
+    else:
+        income, expense, net = cached
+
+    # Kỳ trước để so sánh (phụ thuộc mode, nhưng KHÔNG ảnh hưởng tổng hiện tại)
+    p1, p2 = previous_period(d1, d2, mode)
+    pin, pex, pnet = period_sum(uid, p1, p2)
+
+    def fmt_delta(v, pv):
+        d = v - pv
+        arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")
+        return f"{arrow} {format_vnd(abs(d))} VND so với kỳ trước"
+
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(
+        f"<div style='color:#888'>Tổng thu</div>"
+        f"<div style='color:{COLOR_INCOME};font-weight:700;font-size:2.2rem'>{format_vnd(income)} VND</div>"
+        f"<div style='color:#888;font-size:0.9rem'>{fmt_delta(income, pin)}</div>", unsafe_allow_html=True
+    )
+    c2.markdown(
+        f"<div style='color:#888'>Tổng chi</div>"
+        f"<div style='color:{COLOR_EXPENSE};font-weight:700;font-size:2.2rem'>{format_vnd(expense)} VND</div>"
+        f"<div style='color:#888;font-size:0.9rem'>{fmt_delta(expense, pex)}</div>", unsafe_allow_html=True
+    )
+    c3.markdown(
+        f"<div style='color:#888'>Chênh lệch (thu - chi)</div>"
+        f"<div style='color:{COLOR_NET};font-weight:700;font-size:2.2rem'>{format_vnd(net)} VND</div>"
+        f"<div style='color:#888;font-size:0.9rem'>{fmt_delta(net, pnet)}</div>", unsafe_allow_html=True
+    )
+
+def spending_chart(uid, d1, d2, mode, chart_type: str):
+    df, label, xtype = query_agg_expense(uid, d1, d2, mode)
     if df.empty:
         st.info("Chưa có dữ liệu."); return
-    ch = alt.Chart(df).mark_line(point=True).encode(
+    if chart_type == "Cột":
+        mark = alt.Chart(df).mark_bar(color=COLOR_EXPENSE)
+    else:
+        mark = alt.Chart(df).mark_line(point=True, color=COLOR_EXPENSE)
+    ch = mark.encode(
         x=alt.X(f"{label}:{xtype}", title=label),
-        y=alt.Y("Chi_tiêu:Q", title="Chi tiêu (VND)"),
-        tooltip=[label,"Chi_tiêu"]
+        y=alt.Y("Chi_tieu:Q", title="Chi tiêu (VND)"),
+        tooltip=[label, alt.Tooltip("Chi_tieu:Q", format=",.0f", title="Chi tiêu")]
     ).properties(height=260)
     st.altair_chart(ch, use_container_width=True)
 
-def pie_by_category(uid, d1, d2):
-    df = get_df("""SELECT COALESCE(c.name,'(Không danh mục)') AS Danh_mục,
-                          SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
-                   FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
-                   WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
-                   GROUP BY c.name HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC""",
-                 (uid, str(d1), str(d2)))
+def pie_by_category(uid, d1, d2, group_parent=True):
+    if group_parent:
+        df = get_df("""
+            SELECT COALESCE(cp.name, c.name) AS Danh_mục,
+                   SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
+            FROM transactions t
+            LEFT JOIN categories c  ON c.id=t.category_id
+            LEFT JOIN categories cp ON cp.id=c.parent_id
+            WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
+            GROUP BY COALESCE(cp.name, c.name)
+            HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC
+        """, (uid, str(d1), str(d2)))
+    else:
+        df = get_df("""
+            SELECT COALESCE(c.name,'(Không danh mục)') AS Danh_mục,
+                   SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
+            FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
+            WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
+            GROUP BY c.name HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC
+        """, (uid, str(d1), str(d2)))
+
     if df.empty:
         st.info("Chưa có chi tiêu theo danh mục."); return
+
     st.altair_chart(
         alt.Chart(df).mark_arc().encode(
-            theta="Chi_tiêu:Q", color="Danh_mục:N", tooltip=["Danh_mục","Chi_tiêu"]
+            theta="Chi_tiêu:Q",
+            color=alt.Color("Danh_mục:N", legend=None, scale=alt.Scale(scheme="tableau10")),
+            tooltip=["Danh_mục", alt.Tooltip("Chi_tiêu:Q", format=",.0f")]
         ).properties(height=260),
         use_container_width=True
     )
@@ -474,82 +708,131 @@ def budget_progress_df(uid, d1, d2):
         rows.append({"Danh mục": r["category"], "Đã dùng": used, "Hạn mức": limit, "%": pct})
     return pd.DataFrame(rows)
 
-# FIX + cảnh báo vượt hạn mức
 def budget_progress_chart(df):
-    if df.empty:
-        st.info("Chưa có hạn mức."); return
+    if df is None or df.empty:
+        st.info("Chưa có hạn mức."); 
+        return
 
+    # Chuẩn hoá dữ liệu hiển thị
     df = df.copy()
     df["%"] = pd.to_numeric(df["%"], errors="coerce").fillna(0.0)
 
     def pct_to_color(p):
         p = float(p)
-        if p < 70:  return "#22c55e"
-        if p < 90:  return "#f59e0b"
-        return "#ef4444"
+        if p < 70:  return "#22c55e"   # xanh
+        if p < 90:  return "#f59e0b"   # vàng
+        return "#ef4444"               # đỏ
 
+    # Cột dùng để vẽ (clip <= 100), và cột nhãn hiển thị (giá trị thật)
     df["__pct_vis"] = df["%"].clip(0, 100)
     df["__color"]   = [pct_to_color(x) for x in df["%"]]
+    df["__label"]   = df["%"].map(lambda x: f"{x:.0f}%")
+    # Đẩy nhãn lệch 1 đơn vị để không chạm mép phải khi = 100
+    df["__label_x"] = (df["__pct_vis"] + 1).clip(0, 105)
 
-    over = df[df["%"] > 100].copy()
+    base = alt.Chart(df).encode(
+        y=alt.Y("Danh mục:N", sort='-x', title=None)
+    )
+
+    # Thanh nền 100%
+    bg = base.mark_bar(color="#33333322").encode(
+        x=alt.X("value:Q", title="Đã dùng (%)",
+                scale=alt.Scale(domain=[0, 105]))  # chừa lề phải
+    ).transform_calculate(value="100")
+
+    # Thanh tiến độ (clip <= 100)
+    bar = base.mark_bar(clip=True).encode(
+        x=alt.X("__pct_vis:Q", title="Đã dùng (%)",
+                scale=alt.Scale(domain=[0, 105])),
+        color=alt.Color("__color:N", legend=None, scale=None),
+        tooltip=[
+            alt.Tooltip("Danh mục:N"),
+            alt.Tooltip("%:Q", format=".0f", title="Đã dùng (%)"),
+            alt.Tooltip("Đã dùng:Q", format=",.0f"),
+            alt.Tooltip("Hạn mức:Q", format=",.0f")
+        ]
+    )
+
+    # Nhãn phần trăm: căn trái + đẩy nhẹ sang phải để 100% không bị cắt
+    txt = base.mark_text(align="left", dx=6).encode(
+        x=alt.X("__label_x:Q", scale=alt.Scale(domain=[0, 105])),
+        text=alt.Text("__label:N")
+    )
+
+    height = max(220, 28 * len(df))
+    st.altair_chart((bg + bar + txt).properties(height=height),
+                    use_container_width=True)
+
+    # Cảnh báo vượt hạn mức
+    over = df[df["%"] > 100]
     if not over.empty:
-        items = [f"{r['Danh mục']} ({r['%']:.0f}% | {format_vnd(r['Đã dùng'])}/{format_vnd(r['Hạn mức'])})"
+        items = [f"{r['Danh mục']} ({r['%']:.0f}% | "
+                 f"{format_vnd(r['Đã dùng'])}/{format_vnd(r['Hạn mức'])})"
                  for _, r in over.iterrows()]
         st.warning("⚠ Danh mục vượt hạn mức: " + " · ".join(items))
 
-    base = alt.Chart(df).encode(y=alt.Y("Danh mục:N", sort='-x', title=None))
-    bg = base.mark_bar(color="#33333322").encode(
-        x=alt.X("value:Q", title="Đã dùng (%)", scale=alt.Scale(domain=[0, 100]))
-    ).transform_calculate(value="100")
-    bar = base.mark_bar().encode(
-        x=alt.X("__pct_vis:Q", title="Đã dùng (%)", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("__color:N", legend=None, scale=None),
-        tooltip=[alt.Tooltip("Danh mục:N"),
-                 alt.Tooltip("%:Q", format=".0f", title="Đã dùng (%)"),
-                 alt.Tooltip("Đã dùng:Q", format=",.0f"),
-                 alt.Tooltip("Hạn mức:Q", format=",.0f")]
-    )
-    txt = base.mark_text(dy=-8).encode(x=alt.X("__pct_vis:Q"), text=alt.Text("%:Q", format=".0f"))
-    warn = base.transform_filter(alt.datum["%"] > 100).mark_text(dy=-8).encode(
-        x=alt.value(100), text=alt.value("⚠")
-    )
-    st.altair_chart((bg + bar + txt + warn).properties(height=max(220, 28*len(df))), use_container_width=True)
-
-# ---------- Pages ----------
 def page_home(uid):
     st.subheader("🏠 Trang chủ")
-    today = dt.date.today()
-    if "filter_start" not in st.session_state: st.session_state.filter_start = today.replace(day=1)
-    if "filter_end"   not in st.session_state: st.session_state.filter_end   = today
 
-    c1,c2 = st.columns(2)
+    today = dt.date.today()
+    # Giữ trạng thái bộ lọc ngày
+    if "filter_start" not in st.session_state:
+        st.session_state.filter_start = today.replace(day=1)
+    if "filter_end" not in st.session_state:
+        st.session_state.filter_end = today
+
+    # Hàng chọn ngày
+    c1, c2 = st.columns(2)
     st.session_state.filter_start = c1.date_input("Từ ngày", st.session_state.filter_start)
     st.session_state.filter_end   = c2.date_input("Đến ngày", st.session_state.filter_end)
 
+    # Snapshot khoảng ngày dùng thống nhất toàn trang
+    cur_start = st.session_state.filter_start
+    cur_end   = st.session_state.filter_end
+
+    # Lưu chế độ hiển thị trong session để KPI không “nhấp nháy” số
+    if "home_mode" not in st.session_state:
+        st.session_state.home_mode = "day"  # day/week/month/year
+
+    # KPI (tổng thu/chi/net đặt ngay dưới bộ chọn ngày)
+    kpi(uid, cur_start, cur_end, st.session_state.home_mode)
+
     st.divider()
-    kpi(uid, st.session_state.filter_start, st.session_state.filter_end)
 
-    mode = st.radio("Chế độ hiển thị", ["Ngày","Tháng","Năm"], horizontal=True)
-    agg_key = {"Ngày":"day","Tháng":"month","Năm":"year"}[mode]
+    # Hàng điều khiển: Chế độ hiển thị & Kiểu biểu đồ (đưa lên trước biểu đồ)
+    ctl1, ctl2, _ = st.columns([1.2, 1.0, 2])
+    mode = ctl1.radio("Chế độ hiển thị", ["Ngày","Tuần","Tháng","Năm"],
+                      horizontal=True,
+                      index=["day","week","month","year"].index(st.session_state.home_mode))
+    mode_key = {"Ngày":"day","Tuần":"week","Tháng":"month","Năm":"year"}[mode]
+    st.session_state.home_mode = mode_key  # cập nhật cho lần render kế tiếp
 
-    chart_d1, chart_d2 = st.session_state.filter_start, st.session_state.filter_end
-    if agg_key == "month":
+    chart_type = ctl2.radio("Kiểu biểu đồ", ["Cột","Đường"], horizontal=True, index=0)
+
+    # Điều chỉnh khoảng cho CHART (riêng biểu đồ để dễ nhìn gọn)
+    chart_d1, chart_d2 = cur_start, cur_end
+    if mode_key == "week":
+        chart_d1 = start_weeks_back(chart_d2, 12)
+    elif mode_key == "month":
         chart_d1 = start_months_back(chart_d2, 12)
-    elif agg_key == "year":
+    elif mode_key == "year":
         chart_d1, chart_d2 = year_window(chart_d2, 5)
 
     colA, colB = st.columns([2, 1])
     with colA:
-        st.markdown(f"#### Chi theo {mode.lower()}")
-        spending_chart(uid, chart_d1, chart_d2, agg_key)
+        st.markdown(f"#### Biểu đồ theo {mode.lower()}")
+        spending_chart(uid, chart_d1, chart_d2, mode_key, chart_type)
         st.caption(f"Khoảng hiển thị: {chart_d1} → {chart_d2}")
+
     with colB:
         st.markdown("#### Cơ cấu theo danh mục")
-        pie_by_category(uid, st.session_state.filter_start, st.session_state.filter_end)
+        # Mặc định gộp theo danh mục cha = True
+        group_parent = st.toggle("Gộp theo danh mục cha", value=True, key="home_group_parent")
+        pie_by_category(uid, cur_start, cur_end, group_parent)
 
     st.divider()
     st.markdown("#### Tiến độ hạn mức")
-    dfb = budget_progress_df(uid, st.session_state.filter_start, st.session_state.filter_end)
+    dfb = budget_progress_df(uid, cur_start, cur_end)
     budget_progress_chart(dfb)
 
     st.divider()
@@ -564,15 +847,18 @@ def page_home(uid):
         df.insert(0, "STT", range(1, len(df)+1))
         st.dataframe(df.head(10), use_container_width=True, height=260, hide_index=True)
 
+
 def current_balance(uid, account_id):
     r = fetchone("""SELECT
       (SELECT opening_balance FROM accounts WHERE id=? AND user_id=?) +
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=? AND account_id=? AND type='income'),0) -
+      COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=? AND account_id=? AND type='income'),0) -\
       COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=? AND account_id=? AND type='expense'),0)
       AS bal""", (account_id,uid,uid,account_id,uid,account_id))
     return float(r["bal"] or 0.0)
 
 def page_accounts(uid):
+    render_inline_notice()
+
     st.subheader("👛 Ví / Tài khoản")
     df = get_accounts(uid)
     if df.empty:
@@ -582,50 +868,88 @@ def page_accounts(uid):
         disp["Tên"]  = disp["name"]
         disp["Loại"] = disp["type"].map({"cash":"Tiền mặt","bank":"Tài khoản ngân hàng","card":"Thẻ"})
         disp["Tiền tệ"] = disp["currency"]
-        # Ẩn 'Số dư ban đầu' theo yêu cầu
-        disp["Số dư hiện tại"] = [format_vnd(current_balance(uid, int(r["id"]))) for _,r in df.iterrows()]
+        disp["Số dư hiện tại"] = [format_vnd(current_balance(uid, int(r["id"]))) for _, r in df.iterrows()]
         disp = disp[["Tên","Loại","Tiền tệ","Số dư hiện tại"]]
-        render_table(disp, default_sort_col="Số dư hiện tại", default_asc=False, height=320,
-                     key_suffix="accounts", exclude_sort_cols={"Tên", "Loại", "Tiền tệ"})  # chỉ còn Số dư hiện tại
+
+        render_table(
+            disp,
+            default_sort_col="Số dư hiện tại",
+            default_asc=False,
+            height=320,
+            key_suffix="accounts",
+            exclude_sort_cols={"Tên","Loại","Tiền tệ"},
+            show_type_filters=False,
+            show_sort=True
+        )
 
     st.markdown("#### Thêm ví mới")
     name = st.text_input("Tên ví (tuỳ chọn)")
-    ttype = st.selectbox("Loại",["cash","bank","card"], format_func=lambda x:{"cash":"Tiền mặt","bank":"Tài khoản ngân hàng","card":"Thẻ"}[x])
-    opening = st.number_input("Số dư ban đầu", min_value=0, step=1000)
+    ttype = st.selectbox("Loại",["cash","bank","card"],
+                         format_func=lambda x: {"cash":"Tiền mặt","bank":"Tài khoản ngân hàng","card":"Thẻ"}[x])
+    opening = money_input("Số dư ban đầu (VND)", key="open_balance", placeholder="VD: 2.000.000")
     if st.button("Thêm ví", type="primary"):
         add_account(uid, name or {"cash":"Tiền mặt","bank":"Tài khoản ngân hàng","card":"Thẻ"}[ttype], ttype, opening)
+        _toast_ok("✅ Đã thêm ví mới!")
         st.rerun()
 
 def page_categories(uid):
+    render_inline_notice()
+
     st.subheader("🏷️ Danh mục")
-    df = get_categories(uid)
-    if df.empty:
-        st.info("Chưa có danh mục.")
-    else:
-        show = df.rename(columns={"name":"Tên","type":"Loại"})
-        show["Loại"] = show["Loại"].map(TYPE_LABELS_VN)
 
-        if "cats_filter" not in st.session_state:
-            st.session_state.cats_filter = "Chi tiêu"
-        b1, b2, _ = st.columns([1, 1, 4])
-        if b1.button("🔴 Chỉ Chi tiêu"):
-            st.session_state.cats_filter = "Chi tiêu"
-        if b2.button("🟢 Chỉ Thu nhập"):
-            st.session_state.cats_filter = "Thu nhập"
+    tab_exp, tab_inc = st.tabs(["Chi tiêu","Thu nhập"])
+    for ctype_vi, tab in [("Chi tiêu", tab_exp), ("Thu nhập", tab_inc)]:
+        ctype = "expense" if ctype_vi=="Chi tiêu" else "income"
+        with tab:
+            parents, _ = build_category_tree(uid, ctype)
+            if not parents:
+                st.info("Chưa có danh mục.")
+            else:
+                for p in parents:
+                    with st.expander(f"🏷️ {p['name']}"):
+                        children = p.get("children", [])
+                        if not children:
+                            st.caption("— (Chưa có danh mục con)")
+                        else:
+                            for ch in children:
+                                st.markdown(f"- 🏷️ **{ch['name']}**")
 
-        filtered = show[show["Loại"] == st.session_state.cats_filter].copy()
-        filtered = filtered[["Tên","Loại"]]
-        render_table(filtered, default_sort_col="Loại", default_asc=True, height=300,
-                     key_suffix="cats", exclude_sort_cols={"Tên","Loại"})  # ẩn dropdown sort hoàn toàn
+            st.markdown("##### Thêm danh mục")
+            cname = st.text_input(f"Tên danh mục ({ctype_vi})", key=f"cat_name_{ctype}")
+            # chọn cha (có thể để (Không))
+            all_parents_df = get_df("SELECT id,name FROM categories WHERE user_id=? AND type=? AND parent_id IS NULL ORDER BY name",
+                                    (uid, ctype))
+            parent_names = ["(Không)"] + all_parents_df["name"].tolist()
+            parent_pick = st.selectbox("Thuộc danh mục cha (tuỳ chọn)", parent_names, key=f"cat_parent_{ctype}")
+            parent_id = None
+            if parent_pick != "(Không)":
+                parent_id = int(all_parents_df.loc[all_parents_df["name"]==parent_pick, "id"].iloc[0])
 
-    st.markdown("#### Thêm danh mục")
-    cname = st.text_input("Tên danh mục")
-    ctype = st.selectbox("Loại",["expense","income"], format_func=lambda x: TYPE_LABELS_VN[x])
-    if st.button("Thêm danh mục", type="primary"):
-        if cname.strip(): add_category(uid, cname.strip(), ctype); st.rerun()
-        else: st.error("Tên danh mục không được để trống.")
+            ccol1, ccol2 = st.columns([1,1])
+            if ccol1.button("Thêm danh mục", key=f"btn_add_cat_{ctype}"):
+                if cname.strip():
+                    add_category(uid, cname.strip(), ctype, parent_id)
+                    _toast_ok("✅ Đã thêm danh mục!")
+                    st.rerun()
+                else:
+                    show_notice("❌ Tên danh mục không được để trống.", "error"); st.rerun()
+
+            with ccol2.popover("🗑️ Xoá danh mục", use_container_width=True):
+                all_cats = get_df("SELECT id,name FROM categories WHERE user_id=? AND type=? ORDER BY name",(uid,ctype))
+                if all_cats.empty:
+                    st.caption("Chưa có danh mục để xoá.")
+                else:
+                    del_name = st.selectbox("Chọn danh mục", all_cats["name"].tolist(), key=f"del_{ctype}")
+                    del_id = int(all_cats.loc[all_cats["name"]==del_name, "id"].iloc[0])
+                    st.caption("• Xoá sẽ: xoá budgets liên quan, set NULL cho giao dịch thuộc danh mục này, bỏ liên kết cha của các danh mục con.")
+                    if st.button("Xác nhận xoá", type="secondary", key=f"do_del_{ctype}"):
+                        delete_category(uid, del_id)
+                        _toast_ok("🗑️ Đã xoá danh mục.")
+                        st.rerun()
 
 def page_budgets(uid):
+    render_inline_notice()
+
     st.subheader("🎯 Ngân sách")
     st.caption("Đặt hạn mức chi tiêu theo khoảng ngày cho từng danh mục Chi tiêu.")
 
@@ -637,12 +961,29 @@ def page_budgets(uid):
     cat_id = int(cats[cats["name"]==cat]["id"].iloc[0])
     start = st.date_input("Từ ngày", value=dt.date.today().replace(day=1))
     end   = st.date_input("Đến ngày", value=dt.date.today())
-    amount = st.number_input("Hạn mức (VND)", min_value=0, step=100000)
+    amount = money_input("Hạn mức (VND)", key="budget_amount", placeholder="VD: 2.500.000")
 
-    if st.button("Lưu hạn mức", type="primary"):
+    bcol1, bcol2 = st.columns([1,1])
+    if bcol1.button("Lưu hạn mức", type="primary"):
         execute("""INSERT INTO budgets(user_id,category_id,amount,start_date,end_date)
                    VALUES(?,?,?,?,?)""", (uid, cat_id, float(amount), str(start), str(end)))
-        st.success("Đã lưu hạn mức!")
+        _toast_ok("✅ Đã lưu hạn mức!")
+        st.rerun()
+
+    with bcol2.popover("🗑️ Xoá hạn mức", use_container_width=True):
+        dfb = get_df("""SELECT b.id, c.name AS category, b.start_date, b.end_date, b.amount
+                        FROM budgets b JOIN categories c ON c.id=b.category_id
+                        WHERE b.user_id=? ORDER BY b.start_date DESC""", (uid,))
+        if dfb.empty:
+            st.caption("Chưa có hạn mức để xoá.")
+        else:
+            pick = st.selectbox("Chọn hạn mức", [f"{r['category']} ({r['start_date']} → {r['end_date']}) - {format_vnd(r['amount'])} VND" for _,r in dfb.iterrows()])
+            sel_idx = [f"{r['category']} ({r['start_date']} → {r['end_date']}) - {format_vnd(r['amount'])} VND" for _,r in dfb.iterrows()].index(pick)
+            bid = int(dfb.iloc[sel_idx]["id"])
+            if st.button("Xác nhận xoá", type="secondary"):
+                delete_budget(uid, bid)
+                _toast_ok("🗑️ Đã xoá hạn mức.")
+                st.rerun()
 
     st.divider()
     st.markdown("#### Hạn mức hiện có")
@@ -654,22 +995,46 @@ def page_budgets(uid):
     else:
         df = df.rename(columns={"category":"Danh mục","amount":"Hạn mức (VND)","start_date":"Từ ngày","end_date":"Đến ngày"})
         df["Hạn mức (VND)"] = df["Hạn mức (VND)"].map(format_vnd)
-        render_table(df, default_sort_col="Từ ngày", default_asc=False, height=260, key_suffix="budgets")
+        render_table(df, default_sort_col="Từ ngày", default_asc=False, height=260, key_suffix="budgets",
+                     exclude_sort_cols=set())
 
 def page_reports(uid):
+    render_inline_notice()
+
     st.subheader("📈 Báo cáo")
+
     today = dt.date.today()
-    start = st.date_input("Từ ngày", st.session_state.get("filter_start", today.replace(day=1)))
-    end   = st.date_input("Đến ngày", st.session_state.get("filter_end", today))
-    st.session_state.filter_start = start; st.session_state.filter_end = end
+    default_start = st.session_state.get("filter_start", today.replace(day=1))
+    default_end   = st.session_state.get("filter_end", today)
+    date_range = st.date_input("Theo ngày", value=(default_start, default_end))
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start, end = date_range
+    else:
+        start, end = default_start, default_end
+    st.session_state.filter_start, st.session_state.filter_end = start, end
 
     st.markdown("#### Top danh mục chi")
-    df = get_df("""SELECT COALESCE(c.name,'(Không danh mục)') AS Danh_mục,
-                          SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
-                   FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
-                   WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
-                   GROUP BY c.name HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC LIMIT 10""",
-                 (uid, str(start), str(end)))
+    group_parent = st.toggle("Gộp theo danh mục cha", value=True, key="rep_group_parent")
+    if group_parent:
+        df = get_df("""
+            SELECT COALESCE(cp.name, c.name) AS Danh_mục,
+                   SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
+            FROM transactions t
+            LEFT JOIN categories c  ON c.id=t.category_id
+            LEFT JOIN categories cp ON cp.id=c.parent_id
+            WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
+            GROUP BY COALESCE(cp.name, c.name)
+            HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC LIMIT 10
+        """, (uid, str(start), str(end)))
+    else:
+        df = get_df("""
+            SELECT COALESCE(c.name,'(Không danh mục)') AS Danh_mục,
+                   SUM(CASE WHEN t.type='expense' THEN t.amount ELSE 0 END) AS Chi_tiêu
+            FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
+            WHERE t.user_id=? AND date(t.occurred_at) BETWEEN date(?) AND date(?)
+            GROUP BY c.name HAVING Chi_tiêu>0 ORDER BY Chi_tiêu DESC LIMIT 10
+        """, (uid, str(start), str(end)))
+
     if df.empty:
         st.info("Chưa có dữ liệu.")
     else:
@@ -677,19 +1042,102 @@ def page_reports(uid):
             alt.Chart(df).mark_bar().encode(
                 x=alt.X("Chi_tiêu:Q", title="Chi tiêu (VND)"),
                 y=alt.Y("Danh_mục:N", sort='-x', title="Danh mục"),
-                tooltip=["Danh_mục","Chi_tiêu"]
+                color=alt.Color("Danh_mục:N", legend=None, scale=alt.Scale(scheme="tableau10")),
+                tooltip=["Danh_mục", alt.Tooltip("Chi_tiêu:Q", format=",.0f")]
             ).properties(height=320),
             use_container_width=True
         )
 
-    st.markdown("#### Danh sách giao dịch")
-    df = df_tx_vi(list_transactions(uid, start, end))
+    st.markdown("#### 📊 Danh sách giao dịch")
+    raw_df = list_transactions(uid, start, end)
+    df = df_tx_vi(raw_df)
     if df is not None and not df.empty and "Loại" in df.columns:
         df["Loại"] = df["Loại"].map({"Thu nhập":"🟢 Thu nhập","Chi tiêu":"🔴 Chi tiêu"}).fillna(df["Loại"])
-    render_table(df, default_sort_col="Thời điểm", default_asc=False, height=360, key_suffix="report_tx")
+    render_table(df, default_sort_col="Thời điểm", default_asc=False, height=380,
+                 key_suffix="report_tx", exclude_sort_cols={"Loại","Tiền tệ"},
+                 show_type_filters=True, show_sort=True)
+
+    st.divider()
+    st.markdown("#### 📥 Xuất dữ liệu")
+    if df is None or df.empty:
+        st.caption("Không có dữ liệu để xuất.")
+    else:
+        export = raw_df.rename(columns={
+            "occurred_at":"Ngày giao dịch",
+            "account":"Ví / Tài khoản",
+            "category":"Danh mục",
+            "amount":"Số tiền (VND)",
+            "currency":"Tiền tệ",
+            "notes":"Ghi chú",
+            "tags":"Thẻ",
+            "merchant":"Nơi chi tiêu"
+        })
+        order = ["Ngày giao dịch","Ví / Tài khoản","Danh mục","Số tiền (VND)","Tiền tệ","Ghi chú","Thẻ","Nơi chi tiêu"]
+        export = export[[c for c in order if c in export.columns]]
+
+        csv_bytes = export.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Tải transactions.csv", csv_bytes, file_name="transactions.csv", mime="text/csv")
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            export.to_excel(writer, index=False, sheet_name="transactions")
+            wb = writer.book
+            ws = writer.sheets["transactions"]
+
+            fmt_header = wb.add_format({
+                "bold": True, "align": "center", "valign": "vcenter",
+                "bg_color": "#EEEEEE", "border": 1
+            })
+            fmt_center = wb.add_format({"align": "center", "valign": "vcenter"})
+            fmt_left   = wb.add_format({"align": "left", "valign": "vcenter"})
+            fmt_money  = wb.add_format({"num_format": "#,##0", "align": "center", "valign": "vcenter"})
+            fmt_datetime = wb.add_format({"num_format": "yyyy-mm-dd hh:mm", "align": "center", "valign": "vcenter"})
+
+            for col_idx, col_name in enumerate(export.columns):
+                ws.write(0, col_idx, col_name, fmt_header)
+
+            for i, col in enumerate(export.columns):
+                width = max(12, min(40, int(export[col].astype(str).str.len().quantile(0.9)) + 2))
+                if "Số tiền" in col:
+                    ws.set_column(i, i, width, fmt_money)
+                elif "Ngày giao dịch" in col:
+                    ws.set_column(i, i, width, fmt_datetime)
+                elif col in ("Ghi chú","Thẻ","Nơi chi tiêu"):
+                    ws.set_column(i, i, width, fmt_left)
+                else:
+                    ws.set_column(i, i, width, fmt_center)
+
+            ws.freeze_panes(1, 0)
+
+        st.download_button("Tải transactions.xlsx", buf.getvalue(),
+                           file_name="transactions.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+def page_about(uid):
+    render_inline_notice()
+
+    st.subheader("ℹ️ Giới thiệu")
+    st.markdown(
+        """
+**Expense Manager** là ứng dụng quản lý thu chi cá nhân viết bằng **Python + Streamlit**, lưu trữ bằng **SQLite**.
+
+### Tính năng nổi bật
+- **Theo dõi thu/chi** theo **ngày–tuần–tháng–năm** với **KPI** và so sánh **kỳ trước**
+- **Biểu đồ** chi tiêu dạng **Cột/Đường**; **Pie chart** theo danh mục (mặc định **gộp theo danh mục cha**)
+- **Danh mục cha–con** (tạo/sửa/xoá); thêm giao dịch theo **cha** hoặc **con**
+- **Hạn mức (Ngân sách) theo danh mục**: đặt mục tiêu, xem tiến độ, cảnh báo vượt mức
+- **Báo cáo**: Top danh mục chi, danh sách giao dịch, **xuất CSV/XLSX**
+- **Quản lý ví/tài khoản** và tính **số dư hiện tại**
+- **Xoá an toàn**: giao dịch, hạn mức, danh mục (tự xử lý ràng buộc liên quan)
+
+> Mặc định mọi thống kê đều **gộp theo danh mục cha**; bạn có thể tắt để xem theo danh mục con khi cần.
+        """
+    )
 
 # ---------- Onboarding ----------
 def onboarding_wizard(uid):
+    render_inline_notice()
+
     st.title("🚀 Thiết lập lần đầu")
     if "ob_step" not in st.session_state: st.session_state.ob_step = 1
 
@@ -707,8 +1155,8 @@ def onboarding_wizard(uid):
         except Exception:
             st.error("Không tìm thấy ví mặc định. Hãy đăng xuất và đăng ký lại."); return
         c1,c2 = st.columns(2)
-        cash_text = c1.text_input("Tiền mặt (VND)", placeholder="VD: 2.000.000")
-        bank_text = c2.text_input("Tài khoản ngân hàng (VND)", placeholder="VD: 8.000.000")
+        cash_text = c1.text_input("Tiền mặt (VND)", placeholder="VD: 2.000.000", key="ob_cash")
+        bank_text = c2.text_input("Tài khoản ngân hàng (VND)", placeholder="VD: 8.000.000", key="ob_bank")
         if st.button("Lưu & tiếp tục ➜", type="primary"):
             execute("UPDATE accounts SET opening_balance=? WHERE id=?", (float(parse_vnd_str(cash_text)), cash_id))
             execute("UPDATE accounts SET opening_balance=? WHERE id=?", (float(parse_vnd_str(bank_text)), bank_id))
@@ -728,74 +1176,19 @@ def onboarding_wizard(uid):
                 if cname_i.strip(): add_category(uid, cname_i.strip(), "income"); st.rerun()
 
         if not cats_all.empty:
-            show = cats_all.rename(columns={"name":"Tên","type":"Loại"})
-            show["Loại"] = show["Loại"].map(TYPE_LABELS_VN)
-            render_table(show[["Tên","Loại"]], default_sort_col="Loại", default_asc=True, height=220,
-                         key_suffix="ob", exclude_sort_cols={"Tên"})
+            show = cats_all.rename(columns={"name":"Tên","type":"Loại"})[["Tên","Loại"]]
+            render_table(show, height=220, key_suffix="ob", show_type_filters=False, show_sort=False)
 
         ok = (not get_categories(uid, "expense").empty) and (not get_categories(uid, "income").empty)
         if st.button("Hoàn tất", type="primary", disabled=(not ok)):
             finish_onboarding(uid); st.success("Xong! Bắt đầu dùng ứng dụng thôi 🎉"); st.rerun()
 
-# ---------- Settings ----------
-def page_settings(uid):
-    st.subheader("⚙️ Cài đặt / Xuất dữ liệu")
-    df = list_transactions(uid)
-    if df.empty:
-        st.info("Chưa có dữ liệu để tải.")
-        return
-
-    # Chuẩn hóa dữ liệu tải về: bỏ 2 cột đầu, thêm "Ngày giao dịch", header tiếng Việt
-    df = df.drop(columns=["id", "type"], errors="ignore").copy()
-    df["Ngày giao dịch"] = pd.to_datetime(df["occurred_at"], errors="coerce").dt.date.astype(str)
-
-    rename_map = {
-        "account": "Ví / Tài khoản",
-        "category": "Danh mục",
-        "amount": "Số tiền (VND)",
-        "currency": "Tiền tệ",
-        "notes": "Ghi chú",
-        "tags": "Thẻ",
-        "merchant": "Nơi chi tiêu",
-    }
-    df = df.rename(columns=rename_map)
-    # Sắp xếp cột theo thứ tự mong muốn
-    order = ["Ngày giao dịch", "Ví / Tài khoản", "Danh mục", "Số tiền (VND)", "Tiền tệ", "Ghi chú", "Thẻ", "Nơi chi tiêu"]
-    df = df[[c for c in order if c in df.columns]]
-
-    # CSV có BOM để Excel đọc đúng tiếng Việt
-    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Tải transactions.csv", csv_bytes, file_name="transactions.csv", mime="text/csv")
-
-    # Xuất Excel .xlsx (tự giãn cột)
-    try:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf) as writer:
-            df.to_excel(writer, index=False, sheet_name="transactions")
-            ws = writer.sheets["transactions"]
-            for i, col in enumerate(df.columns):
-                width = max(12, min(40, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
-                try:
-                    ws.set_column(i, i, width)  # xlsxwriter
-                except Exception:
-                    try:
-                        from openpyxl.utils import get_column_letter
-                        ws.column_dimensions[get_column_letter(i+1)].width = width
-                    except Exception:
-                        pass
-        st.download_button(
-            "Tải transactions.xlsx",
-            buf.getvalue(),
-            file_name="transactions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception:
-        st.caption("Không tạo được file .xlsx (thiếu engine). Vẫn có thể dùng CSV (UTF-8 BOM).")
-
 # ---------- Shell ----------
 def screen_login():
     st.title("💸 Expense Manager")
     st.caption("Quản lý chi tiêu cá nhân — Streamlit + SQLite")
+
+    render_inline_notice()
 
     tab1, tab2 = st.tabs(["Đăng nhập","Đăng ký"])
 
@@ -805,9 +1198,11 @@ def screen_login():
         if st.button("Đăng nhập", type="primary", use_container_width=True):
             uid = login_user(email, pw)
             if uid:
-                st.session_state.user_id = int(uid); st.rerun()
+                st.session_state.user_id = int(uid)
+                _toast_ok("✅ Đăng nhập thành công")
+                st.rerun()
             else:
-                st.error("Sai email hoặc mật khẩu.")
+                show_notice("❌ Sai email hoặc mật khẩu.", "error"); st.rerun()
 
     with tab2:
         email_r = st.text_input("Email đăng ký")
@@ -815,12 +1210,16 @@ def screen_login():
         pw2 = st.text_input("Nhập lại mật khẩu", type="password", key="pw2")
         if st.button("Tạo tài khoản", use_container_width=True):
             if not email_r or not pw1:
-                st.error("Vui lòng điền đầy đủ thông tin.")
+                show_notice("❌ Vui lòng điền đầy đủ thông tin.", "error"); st.rerun()
             elif pw1 != pw2:
-                st.error("Mật khẩu nhập lại không khớp.")
+                show_notice("❌ Mật khẩu nhập lại không khớp.", "error"); st.rerun()
             else:
                 ok, msg = create_user(email_r, pw1)
-                st.success(msg) if ok else st.error(msg)
+                if ok:
+                    _toast_ok(msg)
+                    st.rerun()
+                else:
+                    show_notice(msg, "error"); st.rerun()
 
 def app_shell(uid: int):
     u = get_user(uid)
@@ -829,11 +1228,13 @@ def app_shell(uid: int):
         st.write(f"👤 **{u['display_name'] or u['email']}**")
         st.caption(dt.date.today().strftime("%d/%m/%Y"))
         nav = st.radio("Điều hướng",
-                       ["Trang chủ","Giao dịch","Ví/Tài khoản","Danh mục","Ngân sách","Báo cáo","Cài đặt"],
+                       ["Trang chủ","Giao dịch","Ví/Tài khoản","Danh mục","Ngân sách","Báo cáo","Giới thiệu"],
                        label_visibility="collapsed", index=0)
         st.session_state.nav = nav
         if st.button("Đăng xuất", use_container_width=True):
-            st.session_state.clear(); st.rerun()
+            st.session_state.clear()
+            _toast_ok("Đã đăng xuất")
+            st.rerun()
 
     if nav == "Trang chủ":      page_home(uid)
     elif nav == "Giao dịch":    page_transactions(uid)
@@ -841,7 +1242,7 @@ def app_shell(uid: int):
     elif nav == "Danh mục":     page_categories(uid)
     elif nav == "Ngân sách":    page_budgets(uid)
     elif nav == "Báo cáo":      page_reports(uid)
-    else:                       page_settings(uid)
+    else:                       page_about(uid)
 
 # ---------- Main ----------
 def main():
